@@ -1,171 +1,336 @@
 package main
 
 import (
+	"encoding/json"
+	"net"
+	"net/http"
+	"os"
+
+	"github.com/coyove/goflyway/cmd/goflyway/lib"
+	"github.com/coyove/goflyway/pkg/aclrouter"
 	"github.com/coyove/goflyway/pkg/config"
 	"github.com/coyove/goflyway/pkg/logg"
-	"github.com/coyove/goflyway/pkg/lookup"
+	"github.com/coyove/goflyway/pkg/lru"
 	"github.com/coyove/goflyway/proxy"
 
 	"flag"
 	"fmt"
 	"io/ioutil"
-	"runtime"
+	"strings"
 )
+
+var version = "__devel__"
 
 var (
-	G_Config = flag.String("c", "", "config file path")
+	cmdGenCA = flag.Bool("gen-ca", false, "generate certificate (ca.pem) and private key (key.pem)")
+	cmdDebug = flag.Bool("debug", false, "turn on debug mode")
 
-	G_Key         = flag.String("k", "0123456789abcdef", "key, important")
-	G_Auth        = flag.String("a", "", "proxy authentication, form: username:password (remember the colon)")
-	G_Upstream    = flag.String("up", "", "upstream server address (e.g. 127.0.0.1:8100)")
-	G_Local       = flag.String("l", ":8100", "local listening port (remember the colon)")
-	G_Local2      = flag.String("p", "", "local listening port, alias of -l")
-	G_UdpRelay    = flag.Int64("udp", 0, "UDP relay listening port, 0 to disable, not working yet")
-	G_UdpTcp      = flag.Int64("udp-tcp", 1, "use N TCP connections to relay UDP")
-	G_LogLevel    = flag.String("lv", "log", "logging level, whose value can be: dbg, log, warn, err or off")
-	G_GlobalProxy = flag.Bool("g", false, "global proxy")
+	// General flags
+	cmdConfig    = flag.String("c", "", "[SC] config file path")
+	cmdLogLevel  = flag.String("lv", "log", "[SC] logging level: {dbg, log, warn, err, off}")
+	cmdLogFile   = flag.String("lf", "", "[SC] log to file")
+	cmdAuth      = flag.String("a", "", "[SC] proxy authentication, form: username:password (remember the colon)")
+	cmdKey       = flag.String("k", "0123456789abcdef", "[SC] password, do not use the default one")
+	cmdLocal     = flag.String("l", ":8100", "[SC] local listening address")
+	cmdCloseConn = flag.Int64("t", 20, "[SC] close connections when they go idle for at least N sec")
 
-	G_Debug            = flag.Bool("debug", false, "debug mode")
-	G_ProxyPassAddr    = flag.String("proxy-pass", "", "use goflyway as a reverse proxy, http only")
-	G_DisableConsole   = flag.Bool("disable-console", false, "disable the console access")
-	G_RecordLocalError = flag.Bool("local-error", false, "log all localhost errors")
-	G_PartialEncrypt   = flag.Bool("partial", false, "partially encrypt the tunnel traffic")
+	// Server flags
+	cmdThrot     = flag.Int64("throt", 0, "[S] traffic throttling in bytes")
+	cmdThrotMax  = flag.Int64("throt-max", 1024*1024, "[S] traffic throttling token bucket max capacity")
+	cmdDiableUDP = flag.Bool("disable-udp", false, "[S] disable UDP relay")
+	cmdProxyPass = flag.String("proxy-pass", "", "[S] use goflyway as a reverse HTTP proxy")
 
-	G_DNSCacheEntries = flag.Int("dns-cache", 1024, "DNS cache size")
-	G_Throttling      = flag.Int64("throttling", 0, "traffic throttling, experimental")
-	G_ThrottlingMax   = flag.Int64("throttling-max", 1024*1024, "traffic throttling token bucket max capacity")
+	// Client flags
+	cmdGlobal     = flag.Bool("g", false, "[C] global proxy")
+	cmdUpstream   = flag.String("up", "", "[C] upstream server address")
+	cmdPartial    = flag.Bool("partial", false, "[C] partially encrypt the tunnel traffic")
+	cmdUDPonTCP   = flag.Int64("udp-tcp", 1, "[C] use N TCP connections to relay UDP")
+	cmdWebConPort = flag.Int64("web-port", 8101, "[C] web console listening port, 0 to disable")
+	cmdDNSCache   = flag.Int64("dns-cache", 1024, "[C] DNS cache size")
+	cmdMux        = flag.Int64("mux", 0, "[C] limit the total number of TCP connections, 0 means no limit")
+	cmdVPN        = flag.Bool("vpn", false, "[C] vpn mode, used on Android only")
+	cmdACL        = flag.String("acl", "chinalist.txt", "[C] load ACL file")
+
+	// Shadowsocks compatible flags
+	cmdLocal2 = flag.String("p", "", "server listening address")
+
+	_ = flag.Bool("u", true, "placeholder")
+	_ = flag.String("m", "", "placeholder")
+	_ = flag.String("b", "", "placeholder")
+	_ = flag.Bool("V", true, "placeholder")
+	_ = flag.Bool("fast-open", true, "placeholder")
 )
 
-func LoadConfig() {
+func loadConfig() {
 	flag.Parse()
 
-	path := *G_Config
-
-	if path != "" {
-		buf, err := ioutil.ReadFile(path)
-		if err != nil {
-			logg.F(err)
-		}
-
-		cf, err := config.ParseConf(string(buf))
-		if err != nil {
-			logg.F(err)
-		}
-
-		*G_Key = cf.GetString("default", "key", *G_Key)
-		*G_Auth = cf.GetString("default", "auth", *G_Auth)
-		*G_Local = cf.GetString("default", "listen", *G_Local)
-		*G_Upstream = cf.GetString("default", "upstream", *G_Upstream)
-		*G_UdpRelay = cf.GetInt("default", "udp", *G_UdpRelay)
-		*G_UdpTcp = cf.GetInt("default", "udptcp", *G_UdpTcp)
-		*G_LogLevel = cf.GetString("default", "loglevel", *G_LogLevel)
-		*G_GlobalProxy = cf.GetBool("default", "global", *G_GlobalProxy)
-		*G_RecordLocalError = cf.GetBool("misc", "localerror", *G_RecordLocalError)
-		*G_ProxyPassAddr = cf.GetString("misc", "proxypass", *G_ProxyPassAddr)
-
-		*G_DisableConsole = cf.GetBool("misc", "disableconsole", *G_DisableConsole)
-		*G_DNSCacheEntries = int(cf.GetInt("misc", "dnscache", int64(*G_DNSCacheEntries)))
-		*G_PartialEncrypt = cf.GetBool("misc", "partial", *G_PartialEncrypt)
-
-		*G_Throttling = cf.GetInt("experimental", "throttling", *G_Throttling)
-		*G_ThrottlingMax = cf.GetInt("experimental", "throttlingmax", *G_ThrottlingMax)
-	}
-}
-
-func main() {
-	logg.Start()
-	fmt.Println(`     __//                   __ _
-    /.__.\                 / _| |
-    \ \/ /      __ _  ___ | |_| |_   ___      ____ _ _   _
- '__/    \     / _' |/ _ \|  _| | | | \ \ /\ / / _' | | | |
-  \-      )   | (_| | (_) | | | | |_| |\ V  V / (_| | |_| |
-   \_____/     \__, |\___/|_| |_|\__, | \_/\_/ \__,_|\__, |
- ____|_|____    __/ |             __/ |               __/ |
-     " "  cf   |___/             |___/               |___/
- `)
-
-	LoadConfig()
-	logg.SetLevel(*G_LogLevel)
-	logg.RecordLocalhostError(*G_RecordLocalError)
-
-	if *G_Key == "0123456789abcdef" {
-		logg.W("you are using the default key, please change it by setting -k=KEY")
-	}
-
-	if *G_Upstream != "" {
-		if !lookup.LoadOrCreateChinaList("") {
-			logg.W("cannot read chinalist.txt (but it's fine, you can ignore this msg)")
-		}
-	}
-
-	cipher := &proxy.GCipher{
-		KeyString: *G_Key,
-		Partial:   *G_PartialEncrypt,
-	}
-	cipher.New()
-
-	cc := &proxy.ClientConfig{
-		DNSCacheSize:   *G_DNSCacheEntries,
-		GlobalProxy:    *G_GlobalProxy,
-		DisableConsole: *G_DisableConsole,
-		UserAuth:       *G_Auth,
-		Upstream:       *G_Upstream,
-		UDPRelayPort:   int(*G_UdpRelay),
-		UDPRelayCoconn: int(*G_UdpTcp),
-		GCipher:        cipher,
-	}
-
-	sc := &proxy.ServerConfig{
-		GCipher:        cipher,
-		UDPRelayListen: int(*G_UdpRelay),
-		Throttling:     *G_Throttling,
-		ThrottlingMax:  *G_ThrottlingMax,
-		ProxyPassAddr:  *G_ProxyPassAddr,
-	}
-
-	if *G_Auth != "" {
-		sc.Users = map[string]proxy.UserConfig{
-			*G_Auth: {},
-		}
-	}
-
-	var client *proxy.ProxyClient
-	if *G_Debug {
-		logg.L("debug mode on, proxy listening port 8100")
-
-		cc.Upstream = "127.0.0.1:8101"
-		client = proxy.NewClient(":8100", cc)
-		go logg.F(client.Start())
-
-		proxy.StartServer(":8101", sc)
+	path := *cmdConfig
+	if path == "" {
 		return
 	}
 
-	if *G_Upstream != "" {
-		if *G_Local2 != "" {
-			// -p has higher priority than -l, for the sack of SS users
-			client = proxy.NewClient(*G_Local2, cc)
-		} else {
-			client = proxy.NewClient(*G_Local, cc)
+	buf, err := ioutil.ReadFile(path)
+	if err != nil {
+		fmt.Println("* can't load config file:", err)
+		return
+	}
+
+	if strings.Contains(path, "shadowsocks.conf") {
+		cmds := make(map[string]interface{})
+		if err := json.Unmarshal(buf, &cmds); err != nil {
+			fmt.Println("* can't parse config file:", err)
+			return
 		}
 
-		logg.L("Hi! ", client.Nickname, ", proxy is listening at ", client.Localaddr, ", upstream is ", client.Upstream)
-		logg.F(client.Start())
+		*cmdKey = cmds["password"].(string)
+		*cmdUpstream = fmt.Sprintf("%v:%v", cmds["server"], cmds["server_port"])
+		*cmdMux = 10
+		*cmdLogLevel = "dbg"
+		*cmdVPN = true
+		*cmdGlobal = true
+		return
+	}
+
+	cf, err := config.ParseConf(string(buf))
+	if err != nil {
+		fmt.Println("* can't parse config file:", err)
+		return
+	}
+
+	*cmdKey = cf.GetString("default", "password", *cmdKey)
+	*cmdAuth = cf.GetString("default", "auth", *cmdAuth)
+	*cmdLocal = cf.GetString("default", "listen", *cmdLocal)
+	*cmdUpstream = cf.GetString("default", "upstream", *cmdUpstream)
+	*cmdDiableUDP = cf.GetBool("default", "disableudp", *cmdDiableUDP)
+	*cmdUDPonTCP = cf.GetInt("default", "udptcp", *cmdUDPonTCP)
+	*cmdGlobal = cf.GetBool("default", "global", *cmdGlobal)
+	*cmdACL = cf.GetString("default", "acl", *cmdACL)
+	*cmdPartial = cf.GetBool("default", "partial", *cmdPartial)
+
+	*cmdProxyPass = cf.GetString("misc", "proxypass", *cmdProxyPass)
+	*cmdWebConPort = cf.GetInt("misc", "webconport", *cmdWebConPort)
+	*cmdDNSCache = cf.GetInt("misc", "dnscache", *cmdDNSCache)
+	*cmdMux = cf.GetInt("misc", "mux", *cmdMux)
+	*cmdLogLevel = cf.GetString("misc", "loglevel", *cmdLogLevel)
+	*cmdLogFile = cf.GetString("misc", "logfile", *cmdLogFile)
+	*cmdThrot = cf.GetInt("misc", "throt", *cmdThrot)
+	*cmdThrotMax = cf.GetInt("misc", "throtmax", *cmdThrotMax)
+
+	*cmdCloseConn = cf.GetInt("misc", "closeconn", *cmdCloseConn)
+}
+
+func main() {
+	fmt.Println("goflyway (build " + version + ")")
+
+	loadConfig()
+
+	if *cmdGenCA {
+		fmt.Println("* generating CA...")
+
+		cert, key, err := lib.GenCA("goflyway")
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		err1, err2 := ioutil.WriteFile("ca.pem", cert, 0755), ioutil.WriteFile("key.pem", key, 0755)
+		if err1 != nil || err2 != nil {
+			fmt.Println("* error ca.pem:", err1)
+			fmt.Println("* error key.pem:", err2)
+			return
+		}
+
+		fmt.Println("* successfully generated ca.pem/key.pem, please leave them in the same directory with goflyway")
+		fmt.Println("* goflyway will automatically read them when launched")
+		return
+	}
+
+	if *cmdUpstream != "" {
+		fmt.Println("* launched as client")
 	} else {
-		// save some space because server doesn't need lookup
-		lookup.ChinaList = nil
-		lookup.IPv4LookupTable = nil
-		lookup.IPv4PrivateLookupTable = nil
-		lookup.CHN_IP = ""
+		fmt.Println("* launched as server (aka upstream)")
+	}
 
-		// global variables are pain in the ass
-		runtime.GC()
+	if *cmdKey == "0123456789abcdef" {
+		fmt.Println("* you are using the default password, it is recommended to change it: -k=<NEW PASSWORD>")
+	}
 
-		if *G_Local2 != "" {
-			// -p has higher priority than -l, for the sack of SS users
-			proxy.StartServer(*G_Local2, sc)
-		} else {
-			proxy.StartServer(*G_Local, sc)
+	cipher := &proxy.Cipher{Partial: *cmdPartial}
+	cipher.Init(*cmdKey)
+
+	var cc *proxy.ClientConfig
+	var sc *proxy.ServerConfig
+
+	if *cmdMux > 0 {
+		fmt.Println("* TCP multiplexer enabled, limit:", *cmdMux, ", note that you must directly connect to the upstream")
+	}
+
+	if *cmdUpstream != "" || *cmdDebug {
+		acl, err := aclrouter.LoadACL(*cmdACL)
+		if err != nil {
+			fmt.Println("* failed to read ACL config (but it's fine, you can ignore this message)")
+			fmt.Println("*   err:", err)
+		}
+
+		for _, r := range acl.OmitRules {
+			fmt.Println("* ACL omit rule:", r)
+		}
+
+		cc = &proxy.ClientConfig{
+			UserAuth:       *cmdAuth,
+			Upstream:       *cmdUpstream,
+			UDPRelayCoconn: int(*cmdUDPonTCP),
+			Cipher:         cipher,
+			DNSCache:       lru.NewCache(int(*cmdDNSCache)),
+			CACache:        lru.NewCache(256),
+			ACL:            acl,
+			Mux:            int(*cmdMux),
+		}
+
+		if is := func(in string) bool { return strings.HasPrefix(*cmdUpstream, in) }; is("https://") {
+			cc.Connect2Auth, cc.Connect2, _, cc.Upstream = parseAuthURL(*cmdUpstream)
+			fmt.Println("* use HTTPS proxy [", cc.Connect2, "] as the frontend, proxy auth: [", cc.Connect2Auth, "]")
+		} else if gfw, http, ws, cf, fwd, fwdws :=
+			is("gfw://"), is("http://"), is("ws://"), is("cf://"), is("fwd://"), is("fwds://"); gfw || http || ws || cf || fwd || fwdws {
+
+			cc.Connect2Auth, cc.Upstream, cc.URLHeader, cc.DummyDomain = parseAuthURL(*cmdUpstream)
+
+			switch true {
+			case cf:
+				fmt.Println("* connect to the upstream [", cc.Upstream, "] hosted on cloudflare")
+				cc.DummyDomain = cc.Upstream
+			case fwdws, fwd:
+				if cc.URLHeader == "" {
+					cc.URLHeader = "X-Forwarded-Url"
+				}
+				fmt.Println("* forward request to [", cc.Upstream, "], store the true URL in [",
+					cc.URLHeader+": http://"+cc.DummyDomain+"/... ]")
+			case cc.DummyDomain != "":
+				fmt.Println("* use dummy host [", cc.DummyDomain, "] to connect [", cc.Upstream, "]")
+			}
+
+			switch true {
+			case fwdws, cf, ws:
+				cc.Policy.Set(proxy.PolicyWebSocket)
+				fmt.Println("* use WebSocket protocol to transfer data")
+			case fwd, http:
+				cc.Policy.Set(proxy.PolicyManInTheMiddle)
+				fmt.Println("* use MITM to intercept HTTPS (HTTP proxy mode only)")
+				cc.CA = lib.TryLoadCert()
+			}
+		}
+
+		if *cmdGlobal {
+			fmt.Println("* global proxy: goflyway will proxy everything except private IPs")
+			cc.Policy.Set(proxy.PolicyGlobal)
+		}
+
+		if *cmdVPN {
+			cc.Policy.Set(proxy.PolicyVPN)
 		}
 	}
+
+	if *cmdUpstream == "" || *cmdDebug {
+		sc = &proxy.ServerConfig{
+			Cipher:        cipher,
+			Throttling:    *cmdThrot,
+			ThrottlingMax: *cmdThrotMax,
+			ProxyPassAddr: *cmdProxyPass,
+			DisableUDP:    *cmdDiableUDP,
+		}
+
+		if *cmdAuth != "" {
+			sc.Users = map[string]proxy.UserConfig{
+				*cmdAuth: {},
+			}
+		}
+	}
+
+	if *cmdLogFile != "" {
+		logg.Redirect(*cmdLogFile)
+		fmt.Println("* redirect log to", *cmdLogFile)
+	}
+
+	logg.SetLevel(*cmdLogLevel)
+	logg.Start()
+
+	if *cmdDebug {
+		fmt.Println("* debug mode on")
+
+		cc.Upstream = "127.0.0.1:8101"
+		client := proxy.NewClient(":8100", cc)
+		go func() {
+			logg.F(client.Start())
+		}()
+
+		server := proxy.NewServer(":8101", sc)
+		logg.F(server.Start())
+		return
+	}
+
+	if *cmdCloseConn > 0 {
+		cipher.IO.StartPurgeConns(int(*cmdCloseConn))
+	}
+
+	var localaddr string
+	if *cmdLocal2 != "" {
+		// -p has higher priority than -l, for the sack of SS users
+		localaddr = *cmdLocal2
+	} else {
+		localaddr = *cmdLocal
+	}
+
+	if *cmdUpstream != "" {
+		client := proxy.NewClient(localaddr, cc)
+
+		if *cmdWebConPort != 0 {
+			go func() {
+				addr := fmt.Sprintf("127.0.0.1:%d", *cmdWebConPort)
+				http.HandleFunc("/", lib.WebConsoleHTTPHandler(client))
+				fmt.Println("* access client web console at [", addr, "]")
+				logg.F(http.ListenAndServe(addr, nil))
+			}()
+		}
+
+		fmt.Println("* proxy", client.Cipher.Alias, "started at [", client.Localaddr, "], upstream: [", client.Upstream, "]")
+		logg.F(client.Start())
+	} else {
+		server := proxy.NewServer(localaddr, sc)
+		fmt.Println("* upstream", server.Cipher.Alias, "started at [", server.Localaddr, "]")
+		if strings.HasPrefix(sc.ProxyPassAddr, "http") {
+			fmt.Println("* alternatively act as a reverse proxy:", sc.ProxyPassAddr)
+		} else if sc.ProxyPassAddr != "" {
+			fmt.Println("* alternatively act as a file server:", sc.ProxyPassAddr)
+		}
+		logg.F(server.Start())
+	}
+}
+
+func parseAuthURL(in string) (auth string, upstream string, header string, dummy string) {
+	// <scheme>://[<username>:<password>@]<host>:<port>[/[?<header>=]<dummy_host>:<dummy_port>]
+	if idx := strings.Index(in, "://"); idx > -1 {
+		in = in[idx+3:]
+	}
+
+	if idx := strings.Index(in, "/"); idx > -1 {
+		dummy = in[idx+1:]
+		in = in[:idx]
+		if idx = strings.Index(dummy, "="); dummy[0] == '?' && idx > -1 {
+			header = dummy[1:idx]
+			dummy = dummy[idx+1:]
+		}
+	}
+
+	upstream = in
+	if idx := strings.Index(in, "@"); idx > -1 {
+		auth = in[:idx]
+		upstream = in[idx+1:]
+	}
+
+	if _, _, err := net.SplitHostPort(upstream); err != nil {
+		fmt.Println("* invalid upstream destination:", upstream, err)
+		os.Exit(1)
+	}
+
+	return
 }

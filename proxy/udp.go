@@ -1,6 +1,9 @@
 package proxy
 
 import (
+	"fmt"
+	"time"
+
 	"github.com/coyove/goflyway/pkg/logg"
 
 	"encoding/binary"
@@ -8,41 +11,34 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"time"
 )
 
-const (
-	UOT_HEADER = byte(0x07)
-)
-
-type addr_t struct {
+type uAddr struct {
 	ip   net.IP
 	host string
 	port int
 	size int
 }
 
-func (a *addr_t) String() string {
+func (a *uAddr) String() string {
 	return a.HostString() + ":" + strconv.Itoa(a.port)
 }
 
-func (a *addr_t) HostString() string {
+func (a *uAddr) HostString() string {
 	if a.ip != nil {
 		if len(a.ip) == net.IPv4len {
 			return a.ip.String()
-		} else {
-			return "[" + a.ip.String() + "]"
 		}
-	} else {
-		if strings.Contains(a.host, ":") && a.host[0] != '[' {
-			return "[" + a.host + "]"
-		} else {
-			return a.host
-		}
+		return "[" + a.ip.String() + "]"
 	}
+
+	if strings.Contains(a.host, ":") && a.host[0] != '[' {
+		return "[" + a.host + "]"
+	}
+	return a.host
 }
 
-func (a *addr_t) IP() net.IP {
+func (a *uAddr) IP() net.IP {
 	if a.ip != nil {
 		return a.ip
 	}
@@ -55,7 +51,7 @@ func (a *addr_t) IP() net.IP {
 	return ip.IP
 }
 
-func (a *addr_t) IsAllZeros() bool {
+func (a *uAddr) IsAllZeros() bool {
 	if a.ip != nil {
 		return a.ip.IsUnspecified() && a.port == 0
 	}
@@ -63,378 +59,325 @@ func (a *addr_t) IsAllZeros() bool {
 	return false
 }
 
-func parseDstFrom(conn net.Conn, typeBuf []byte, omitCheck bool) (byte, *addr_t, bool) {
-	var err error
+func parseUDPHeader(conn net.Conn, buf []byte, omitCheck bool) (method byte, addr *uAddr, err error) {
 	var n int
 
-	if typeBuf == nil {
-		typeBuf, n = make([]byte, 256+3+1+1+2), 0
+	if buf == nil {
+		buf, n = make([]byte, 256+3+1+1+2), 0
 		// conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		if n, err = io.ReadAtLeast(conn, typeBuf, 3+1+net.IPv4len+2); err != nil {
-			logg.E(CANNOT_READ_BUF, err)
-			return 0x0, nil, false
+		if n, err = io.ReadAtLeast(conn, buf, 3+1+net.IPv4len+2); err != nil {
+			return
 		}
 	}
 
-	if typeBuf[0] != SOCKS5_VERSION && !omitCheck {
-		logg.E(NOT_SOCKS5)
-		return 0x0, nil, false
+	if !omitCheck {
+		if buf[0] != socksVersion5 {
+			return 0, nil, fmt.Errorf(socksVersionErr, buf[0])
+		}
+
+		if buf[1] != 0x01 && buf[1] != 0x03 {
+			return 0, nil, fmt.Errorf(socksMethodErr, buf[1])
+		}
 	}
 
-	if typeBuf[1] != 0x01 && typeBuf[1] != 0x03 && !omitCheck { // 0x01: establish a TCP/IP stream connection
-		logg.E("socks5 invalid command: ", typeBuf[1])
-		return 0x0, nil, false
-	}
-
-	addr := &addr_t{}
-	switch typeBuf[3] {
-	case SOCKS_TYPE_IPv4:
+	addr = &uAddr{}
+	switch buf[3] {
+	case socksAddrIPv4:
 		addr.size = 3 + 1 + net.IPv4len + 2
-	case SOCKS_TYPE_IPv6:
+	case socksAddrIPv6:
 		addr.size = 3 + 1 + net.IPv6len + 2
-	case SOCKS_TYPE_Dm:
-		addr.size = 3 + 1 + 1 + int(typeBuf[4]) + 2
+	case socksAddrDomain:
+		addr.size = 3 + 1 + 1 + int(buf[4]) + 2
 	default:
-		logg.E("socks5 invalid address type")
-		return 0x0, nil, false
+		return 0, nil, fmt.Errorf(socksAddressErr, buf[3])
 	}
 
 	if conn != nil {
-		if _, err = io.ReadFull(conn, typeBuf[n:addr.size]); err != nil {
-			logg.E(CANNOT_READ_BUF, err)
-			return 0x0, nil, false
+		if _, err = io.ReadFull(conn, buf[n:addr.size]); err != nil {
+			return
 		}
 	} else {
-		if len(typeBuf) < addr.size {
-			logg.E(CANNOT_READ_BUF, err)
-			return 0x0, nil, false
+		if len(buf) < addr.size {
+			return 0, nil, io.EOF
 		}
 	}
 
-	rawaddr := typeBuf[3 : addr.size-2]
-	addr.port = int(binary.BigEndian.Uint16(typeBuf[addr.size-2 : addr.size]))
+	rawaddr := buf[3 : addr.size-2]
+	addr.port = int(binary.BigEndian.Uint16(buf[addr.size-2 : addr.size]))
 
-	switch typeBuf[3] {
-	case SOCKS_TYPE_IPv4:
+	switch buf[3] {
+	case socksAddrIPv4:
 		addr.ip = net.IP(rawaddr[1:])
-	case SOCKS_TYPE_IPv6:
+	case socksAddrIPv6:
 		addr.ip = net.IP(rawaddr[1:])
 	default:
 		addr.host = string(rawaddr[2:])
 	}
 
-	return typeBuf[1], addr, true
+	return buf[1], addr, nil
 }
 
-func derr(err error) bool {
-	if ne, ok := err.(net.Error); ok {
-		if ne.Timeout() {
-			return false
-		}
+type udpBridgeConn struct {
+	*net.UDPConn
+	udpSrc net.Addr
+
+	initBuf []byte
+
+	waitingMore struct {
+		incompleteLen bool
+
+		buf    []byte
+		remain int
 	}
 
-	return true
+	socks bool
+	dst   *uAddr
+
+	closed bool
 }
 
-func (proxy *ProxyUpstream) handleTCPtoUDP(c net.Conn) {
-	defer c.Close()
-
-	readFromTCP := func() (string, []byte) {
-		xbuf := make([]byte, 2)
-
-		tryRead := func(buf []byte, min int) bool {
-			if _, err := io.ReadAtLeast(c, buf, min); err != nil {
-				if derr(err) {
-					logg.E(CANNOT_READ_BUF, err)
-				}
-				return false
-			}
-
-			return true
-		}
-
-		c.SetReadDeadline(time.Now().Add(time.Duration(TCP_TIMEOUT) * time.Second))
-		if !tryRead(xbuf, 2) {
-			return "", nil
-		}
-
-		if xbuf[0] != UOT_HEADER {
-			return "", nil
-		}
-
-		authlen := int(xbuf[1])
-		if authlen > 0 {
-			authdata := make([]byte, authlen)
-			if !tryRead(authdata, authlen) {
-				return "", nil
-			}
-
-			if !proxy.auth(string(proxy.GCipher.Decrypt(authdata))) {
-				return "", nil
-			}
-		} else if proxy.Users != nil {
-			return "", nil
-		}
-
-		if !tryRead(xbuf[:1], 1) {
-			return "", nil
-		}
-
-		hostlen := int(xbuf[0])
-		hostbuf := make([]byte, hostlen)
-
-		if !tryRead(hostbuf, hostlen) {
-			return "", nil
-		}
-
-		if hostlen < 4 {
-			logg.E("ttu: invalid hostlen")
-			return "", nil
-		}
-
-		host := string(proxy.GCipher.Decrypt(hostbuf[:hostlen-4]))
-		port := int(binary.BigEndian.Uint16(hostbuf[hostlen-4 : hostlen-2]))
-		host = host + ":" + strconv.Itoa(port)
-
-		payloadlen := int(binary.BigEndian.Uint16(hostbuf[hostlen-2:]))
-		payload := make([]byte, payloadlen)
-
-		if !tryRead(payload, payloadlen) {
-			return "", nil
-		}
-
-		payload = proxy.GCipher.Decrypt(payload)
-		return host, payload
+func (c *udpBridgeConn) Read(b []byte) (n int, err error) {
+	const expectedMaxPacketSize = 2050
+	if len(b) < expectedMaxPacketSize {
+		panic(fmt.Sprintf("goflyway expects that all UDP packet must be smaller than %d bytes", expectedMaxPacketSize-2))
 	}
 
-	host, payload := readFromTCP()
-	if payload == nil || host == "" {
-		return
+	if c.initBuf != nil {
+		n = len(c.initBuf)
+		copy(b[2:], c.initBuf)
+		c.initBuf = nil
+		goto PUT_HEADER
 	}
 
-	uaddr, _ := net.ResolveUDPAddr("udp", host)
-	rconn, err := net.DialUDP("udp", nil, uaddr)
+	n, c.udpSrc, err = c.UDPConn.ReadFrom(b) // We assume that src never change
 	if err != nil {
-		logg.E(err)
 		return
 	}
 
-	rconn.SetWriteDeadline(time.Now().Add(time.Duration(UDP_TIMEOUT) * time.Second))
-	if _, err := rconn.Write(payload); err != nil {
-		if derr(err) {
-			logg.E("ttu: write to target: ", err)
+	if c.socks {
+		_, dst, err := parseUDPHeader(nil, b[:n], true)
+		if err != nil {
+			return 0, err
 		}
+
+		copy(b[2:], b[dst.size:n])
+		n -= dst.size
+	} else {
+		copy(b[2:], b[:n])
+	}
+
+PUT_HEADER:
+	binary.BigEndian.PutUint16(b, uint16(n))
+	logg.D("UDP read ", n, " bytes")
+	return n + 2, err
+}
+
+func (c *udpBridgeConn) write(b []byte) (n int, err error) {
+	if !c.socks {
+		n, err = c.UDPConn.Write(b)
+		if err == nil {
+			n += 2
+		}
+
 		return
 	}
 
-	quit := make(chan bool)
-	go func() { // goroutine: read from downstream tcp, write to target host udp
-	READ:
-		for {
-			select {
-			case <-quit:
-				break READ
-			default:
-				if _, buf := readFromTCP(); buf != nil {
-					rconn.SetWriteDeadline(time.Now().Add(time.Duration(UDP_TIMEOUT) * time.Second))
-					if _, err := rconn.Write(buf); err != nil {
-						if derr(err) {
-							logg.E("ttu: write to target: ", err)
-						}
-						break READ
-					}
-				} else {
-					break READ
-				}
-			}
-		}
+	if c.udpSrc == nil {
+		logg.W("UDP early write")
+		return
+	}
 
-		c.Close()     // may double-close, but fine
-		rconn.Close() // may double-close, but fine
+	xbuf := make([]byte, len(b)+256)
+	ln := 0
+
+	if c.dst.host != "" {
+		hl := len(c.dst.host)
+
+		xbuf[3] = 0x03
+		xbuf[4] = byte(hl)
+		copy(xbuf[5:], []byte(c.dst.host))
+
+		binary.BigEndian.PutUint16(xbuf[5+hl:], uint16(c.dst.port))
+		ln = 5 + hl + 2
+		copy(xbuf[ln:], b)
+		//
+	} else if len(c.dst.ip) == net.IPv4len {
+		ln = len(udpHeaderIPv4)
+
+		copy(xbuf, udpHeaderIPv4)
+		copy(xbuf[4:8], c.dst.ip)
+		binary.BigEndian.PutUint16(xbuf[8:], uint16(c.dst.port))
+		copy(xbuf[ln:], b)
+
+	} else {
+		ln = len(udpHeaderIPv6)
+
+		copy(xbuf, udpHeaderIPv6)
+		copy(xbuf[4:20], c.dst.ip)
+		binary.BigEndian.PutUint16(xbuf[20:], uint16(c.dst.port))
+		copy(xbuf[ln:], b)
+	}
+
+	n, err = c.WriteTo(xbuf[:ln+len(b)], c.udpSrc)
+	if err == nil {
+		n += 2 - ln
+	}
+	return
+}
+
+func (c *udpBridgeConn) Write(b []byte) (n int, err error) {
+	// For simplicity, when return "n", it should always equal to the total length of "b" if writing succeeded
+	// No ErrShortWrite shall happen
+	defer func() {
+		if err == nil {
+			n = len(b)
+			logg.D("UDP write ", n, " bytes")
+		} else {
+			logg.D("UDP write error: ", err)
+		}
 	}()
 
-	buf := make([]byte, 2048)
-	for { // read from target host udp, write to downstream tcp
-		rconn.SetReadDeadline(time.Now().Add(time.Duration(UDP_TIMEOUT) * time.Second))
-		n, _, err := rconn.ReadFrom(buf)
-		// logg.L(n, ad.String(), err)
-
-		if n > 0 {
-			ybuf := proxy.GCipher.Encrypt(buf[:n])
-			payload := append([]byte{UOT_HEADER, 0, 0}, ybuf...)
-			binary.BigEndian.PutUint16(payload[1:3], uint16(len(ybuf)))
-
-			c.SetWriteDeadline(time.Now().Add(time.Duration(UDP_TIMEOUT) * time.Second))
-			_, err := c.Write(payload)
-			if err != nil {
-				if derr(err) {
-					logg.E("ttu: write to downstream: ", err)
-				}
-
-				break
-			}
-		}
-
-		if err != nil {
-			if derr(err) {
-				logg.E("ttu: readfrom: ", err)
-			}
-
-			break
-		}
+	if b == nil || len(b) == 0 {
+		return
 	}
 
-	quit <- true
-	rconn.Close()
+	var ln int
+	var buf []byte
+
+	if c.waitingMore.incompleteLen {
+		c.waitingMore.incompleteLen = false
+
+		ln = int(binary.BigEndian.Uint16([]byte{c.waitingMore.buf[0], b[0]}))
+		buf = b[1:]
+
+		goto TEST
+	}
+
+	if c.waitingMore.remain > 0 {
+		remain := c.waitingMore.remain
+		c.waitingMore.remain -= len(b)
+
+		if c.waitingMore.remain == 0 {
+			// Best case
+			return c.write(append(c.waitingMore.buf, b...))
+		}
+
+		if c.waitingMore.remain > 0 {
+			// We still don't have enough data to write
+			c.waitingMore.buf = append(c.waitingMore.buf, b...)
+			return len(b), nil
+		}
+
+		// b contains more than what we need
+		if n, err = c.write(append(c.waitingMore.buf, b[:remain]...)); err != nil {
+			return
+		}
+
+		b = b[remain:]
+		// Let's deal with the trailing bytes
+	}
+
+	if len(b) == 1 {
+		logg.D("rare case: incomplete header")
+		c.waitingMore.buf = b
+		c.waitingMore.incompleteLen = true // "len" should have 2 bytes, we got 1
+		return 1, nil
+	}
+
+	ln = int(binary.BigEndian.Uint16(b))
+	buf = b[2:]
+
+TEST:
+	if len(buf) < ln {
+		logg.D("rare case: incomplete buffer")
+		c.waitingMore.buf = buf
+		c.waitingMore.remain = ln - len(buf)
+		return len(b), nil
+	}
+
+	if len(buf) == ln {
+		return c.write(buf)
+	}
+
+	// len(buf) > ln
+	logg.D("rare case: overflow buffer")
+	if n, err = c.write(buf[:ln]); err != nil {
+		return
+	}
+
+	return c.Write(buf[ln:])
 }
 
-func (proxy *ProxyClient) dialForUDP(client net.Addr, dst string) (net.Conn, string, bool) {
-	proxy.udp.upstream.Lock()
-	defer proxy.udp.upstream.Unlock()
+func (c *udpBridgeConn) Close() error {
+	c.closed = true
+	return c.UDPConn.Close()
+}
 
-	if proxy.udp.upstream.conns == nil {
-		proxy.udp.upstream.conns = make(map[string]net.Conn)
+func (proxy *ProxyClient) handleUDPtoTCP(relay *net.UDPConn, client net.Conn) {
+	defer relay.Close()
+	defer client.Close()
+
+	// prepare the response to answer the client
+	response, port := make([]byte, len(okSOCKS)), relay.LocalAddr().(*net.UDPAddr).Port
+
+	copy(response, okSOCKS)
+	binary.BigEndian.PutUint16(response[8:], uint16(port))
+	client.Write(response)
+
+	buf := make([]byte, 2048)
+	n, src, err := relay.ReadFrom(buf)
+	if err != nil {
+		logg.E("can't read initial packet: ", err)
+		return
 	}
 
-	str := client.String() + "-" + dst + "-" + strconv.Itoa(proxy.GCipher.Rand.Intn(proxy.UDPRelayCoconn))
-	if conn, ok := proxy.udp.upstream.conns[str]; ok {
-		return conn, str, false
-	}
-
-	u, _, _ := net.SplitHostPort(proxy.Upstream)
-	upstreamConn, err := net.Dial("tcp", u+":"+strconv.Itoa(proxy.UDPRelayPort))
+	_, dst, err := parseUDPHeader(nil, buf[:n], true)
 	if err != nil {
 		logg.E(err)
-		return nil, "", false
-	}
-
-	proxy.udp.upstream.conns[str] = upstreamConn
-	return upstreamConn, str, true
-}
-
-func (proxy *ProxyClient) handleUDPtoTCP(b []byte, relay *net.UDPConn, client net.Conn, auth string, src net.Addr) {
-	_, dst, ok := parseDstFrom(nil, b, true)
-	if !ok {
 		return
 	}
 
-	upstreamConn, token, firstTime := proxy.dialForUDP(src, dst.String())
-	if upstreamConn == nil {
-		return
-	}
+	logg.D("UDP relay listening port: ", port, ", destination: ", dst.String())
 
-	// prepare the payload
-	buf := proxy.GCipher.Encrypt(b[dst.size:])
+	maxConns := proxy.UDPRelayCoconn
+	srcs := make([]*udpBridgeConn, maxConns)
+	conns := make([]net.Conn, maxConns)
 
-	// i know it's better to encrypt ip bytes (4 or 16 + 2 bytes port) rather than
-	// string representation (like "100.200.300.400:56789", that is 21 bytes!)
-	// but this is one time payload, it's fine, easy.
-	enchost := proxy.GCipher.Encrypt([]byte(dst.HostString()))
-
-	var encauth []byte
-	var authlen = 0
-
-	if auth != "" {
-		encauth = proxy.GCipher.Encrypt([]byte(auth))
-		authlen = len(encauth)
-	}
-
-	//                                   +----len---+              +-------------- hostlen -------------+
-	// | 0x07 (1b header) | authlen (1b) | authdata | hostlen (1b) | host | port (2b) | payloadlen (2b) |
-
-	payload := make([]byte, 1+1+authlen+1+len(enchost)+2+2+len(buf))
-
-	payload[0] = UOT_HEADER
-
-	payload[1] = byte(authlen)
-	if encauth != nil {
-		copy(payload[2:], encauth)
-	}
-
-	payload[2+authlen] = byte(len(enchost) + 2 + 2)
-
-	copy(payload[2+authlen+1:], enchost)
-
-	binary.BigEndian.PutUint16(payload[2+authlen+1+len(enchost):], uint16(dst.port))
-	binary.BigEndian.PutUint16(payload[2+authlen+1+len(enchost)+2:], uint16(len(buf)))
-
-	copy(payload[2+authlen+1+len(enchost)+2+2:], buf)
-
-	upstreamConn.Write(payload)
-
-	if !firstTime {
-		// we are not the first one using this connection, so just return here
-		return
-	}
-
-	xbuf := make([]byte, 2048)
-	for {
-		readFromTCP := func() []byte {
-			xbuf := make([]byte, 3)
-			upstreamConn.SetReadDeadline(time.Now().Add(time.Duration(TCP_TIMEOUT) * time.Second))
-
-			if _, err := io.ReadAtLeast(upstreamConn, xbuf, 3); err != nil {
-				if err != io.EOF && derr(err) {
-					logg.E(CANNOT_READ_BUF, err)
-				}
-
-				return nil
-			}
-
-			payloadlen := int(binary.BigEndian.Uint16(xbuf[1:3]))
-			payload := make([]byte, payloadlen)
-			if _, err := io.ReadAtLeast(upstreamConn, payload, payloadlen); err != nil {
-				if derr(err) {
-					logg.E(CANNOT_READ_BUF, err)
-				}
-				return nil
-			}
-
-			return proxy.GCipher.Decrypt(payload)
+	for i := 0; i < maxConns; i++ {
+		srcs[i] = &udpBridgeConn{
+			UDPConn: relay,
+			socks:   true,
+			udpSrc:  src,
+			dst:     dst,
 		}
 
-		// read from upstream
-		buf := readFromTCP()
+		if i == 0 {
+			// The first connection will be responsible for sending the initial buffer
+			srcs[0].initBuf = buf[dst.size:n]
+		}
 
-		if buf != nil && len(buf) > 0 {
-			logg.D("utt receive: ", len(buf))
-
-			var err error
-			var ln int
-			// prepare the response header
-			if len(dst.ip) == net.IPv4len {
-				copy(xbuf, UDP_REQUEST_HEADER)
-				copy(xbuf[4:8], dst.ip)
-				binary.BigEndian.PutUint16(xbuf[8:], uint16(dst.port))
-				copy(xbuf[len(UDP_REQUEST_HEADER):], buf)
-
-				ln = len(buf) + len(UDP_REQUEST_HEADER)
-			} else {
-				copy(xbuf, UDP_REQUEST_HEADER6)
-				copy(xbuf[4:20], dst.ip)
-				binary.BigEndian.PutUint16(xbuf[20:], uint16(dst.port))
-				copy(xbuf[len(UDP_REQUEST_HEADER6):], buf)
-
-				ln = len(buf) + len(UDP_REQUEST_HEADER6)
-			}
-
-			_, err = relay.WriteTo(xbuf[:ln], src)
-
-			if err != nil {
-				logg.E("utt: write: ", err)
-				break
-			}
+		if proxy.Policy.IsSet(PolicyWebSocket) {
+			conns[i] = proxy.dialUpstreamAndBridgeWS(srcs[i], dst.String(), nil, doUDPRelay)
 		} else {
+			conns[i] = proxy.dialUpstreamAndBridge(srcs[i], dst.String(), nil, doUDPRelay)
+		}
+	}
+
+	// Connections may be double closed, so we manually check them
+	for {
+		count := 0
+		for _, src := range srcs {
+			if src.closed {
+				count++
+			}
+		}
+
+		if count == maxConns {
 			break
 		}
+
+		time.Sleep(time.Second)
 	}
 
-	proxy.udp.upstream.Lock()
-	delete(proxy.udp.upstream.conns, token)
-	proxy.udp.upstream.Unlock()
-
-	upstreamConn.Close()
-	client.Close()
-	relay.Close()
-	logg.D("udp close: ", client)
+	logg.D("closing relay port: ", port)
 }

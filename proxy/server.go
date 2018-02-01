@@ -3,6 +3,7 @@ package proxy
 import (
 	"github.com/coyove/goflyway/pkg/logg"
 	"github.com/coyove/goflyway/pkg/lru"
+	"github.com/coyove/tcpmux"
 
 	"net"
 	"net/http"
@@ -13,19 +14,15 @@ import (
 	"time"
 )
 
-const (
-	_RETRY_OPPORTUNITIES = 2
-)
-
 type ServerConfig struct {
-	Throttling     int64
-	ThrottlingMax  int64
-	UDPRelayListen int
-	ProxyPassAddr  string
+	Throttling    int64
+	ThrottlingMax int64
+	DisableUDP    bool
+	ProxyPassAddr string
 
 	Users map[string]UserConfig
 
-	*GCipher
+	*Cipher
 }
 
 // for multi-users server, not implemented yet
@@ -42,6 +39,8 @@ type ProxyUpstream struct {
 	trustedTokens map[string]bool
 	rkeyHeader    string
 
+	Localaddr string
+
 	*ServerConfig
 }
 
@@ -54,19 +53,16 @@ func (proxy *ProxyUpstream) auth(auth string) bool {
 	return false
 }
 
-func (proxy *ProxyUpstream) getIOConfig(auth string) *IOConfig {
-	var ioc *IOConfig
+func (proxy *ProxyUpstream) getIOConfig(auth string) IOConfig {
+	var ioc IOConfig
 	if proxy.Throttling > 0 {
-		ioc = &IOConfig{NewTokenBucket(proxy.Throttling, proxy.ThrottlingMax)}
+		ioc.Bucket = NewTokenBucket(proxy.Throttling, proxy.ThrottlingMax)
 	}
-
 	return ioc
 }
 
-func (proxy *ProxyUpstream) Write(w http.ResponseWriter, r *http.Request, p []byte, code int) (n int, err error) {
-	key := proxy.GCipher.ReverseIV(SafeGetHeader(r, proxy.rkeyHeader))
-
-	if ctr := proxy.GCipher.GetCipherStream(key); ctr != nil {
+func (proxy *ProxyUpstream) Write(w http.ResponseWriter, key, p []byte, code int) (n int, err error) {
+	if ctr := proxy.Cipher.getCipherStream(key); ctr != nil {
 		ctr.XorBuffer(p)
 	}
 
@@ -91,133 +87,152 @@ func (proxy *ProxyUpstream) hijack(w http.ResponseWriter) net.Conn {
 }
 
 func (proxy *ProxyUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// remote dns lookup
-	if r.Method == "GET" && r.ProtoMajor == 1 && r.ProtoMinor == 0 && len(r.RequestURI) > 0 {
-		p := strings.Split(proxy.GCipher.DecryptString(r.RequestURI[1:]), "-")
-		if len(p) != 2 {
-			return
-		}
-
-		if proxy.Users != nil && !proxy.auth(p[0]) {
-			return
-		}
-
-		conn := proxy.hijack(w)
-		if conn == nil {
-			return
-		}
-
-		ip, err := net.ResolveIPAddr("ip4", p[1])
-		if err != nil {
-			return
-		}
-
-		conn.Write(ip.IP)
-		conn.Close()
-		return
-	}
-
-	replyRandom := func() {
+	replySomething := func() {
 		if proxy.rp == nil {
-			round := proxy.Rand.Intn(32) + 32
-			buf := make([]byte, 2048)
-			for r := 0; r < round; r++ {
-				ln := proxy.Rand.Intn(1024) + 1024
-
-				for i := 0; i < ln; i++ {
-					buf[i] = byte(proxy.Rand.Intn(256))
-				}
-
-				w.Write(buf[:ln])
-				time.Sleep(time.Duration(proxy.Rand.Intn(100)) * time.Millisecond)
-			}
+			w.WriteHeader(404)
+			w.Write([]byte(`<html>
+<head><title>404 Not Found</title></head>
+<body bgcolor="white">
+<center><h1>404 Not Found</h1></center>
+<hr><center>nginx</center>
+</body>
+</html>`))
 		} else {
 			proxy.rp.ServeHTTP(w, r)
 		}
 	}
 
-	var auth string
-	if proxy.Users != nil {
-		if auth = SafeGetHeader(r, AUTH_HEADER); auth != "" {
-			auth = proxy.GCipher.DecryptString(auth)
-			if proxy.auth(auth) {
-				goto AUTH_OK
-			}
-		}
-
-		return
-	}
-
-AUTH_OK:
-
 	addr, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		logg.W("unknown address: ", r.RemoteAddr)
-		replyRandom()
+		replySomething()
 		return
 	}
 
-	rkey := SafeGetHeader(r, proxy.rkeyHeader)
-	rkeybuf := proxy.GCipher.ReverseIV(rkey)
+	rkey := r.Header.Get(proxy.rkeyHeader)
+	options, rkeybuf, authbuf := proxy.Cipher.ReverseIV(rkey)
+
 	if rkeybuf == nil {
-		logg.W("can't find header, check your client's key")
+		logg.D("cannot find header, check your client's key, from: ", addr)
 		proxy.blacklist.Add(addr, nil)
-		replyRandom()
+		replySomething()
 		return
 	}
 
-	if isTrustedToken("unlock", rkeybuf) {
-		if proxy.trustedTokens[rkey] {
-			proxy.blacklist.Add(addr, nil)
-			replyRandom()
+	var auth string
+	if proxy.Users != nil {
+		if authbuf == nil || string(authbuf) == "" || !proxy.auth(string(authbuf)) {
+			logg.W("user auth failed, from: ", addr)
 			return
 		}
 
-		proxy.trustedTokens[rkey] = true
-		proxy.blacklist.Remove(addr)
-		logg.L("unlock request accepted from: ", addr)
-		return
+		auth = string(authbuf)
 	}
 
-	if h, _ := proxy.blacklist.GetHits(addr); h > _RETRY_OPPORTUNITIES {
-		logg.W("repeated access using invalid key, from: ", addr)
-		replyRandom()
-		return
+	if options == 0 {
+		r := isTrustedToken("unlock", rkeybuf)
+
+		if r == -1 {
+			logg.W("someone is using an old token: ", addr)
+			proxy.blacklist.Add(addr, nil)
+			replySomething()
+			return
+		}
+
+		if r == 1 {
+			proxy.blacklist.Remove(addr)
+			logg.L("unlock request accepted from: ", addr)
+			return
+		}
 	}
 
-	if host, mark := TryDecryptHost(proxy.GCipher, r.Host); mark == HOST_HTTP_CONNECT || mark == HOST_SOCKS_CONNECT {
-		logg.D(mark, " ", host)
-		// dig tunnel
+	if h, _ := proxy.blacklist.GetHits(addr); h > invalidRequestRetry {
+		logg.D("repeated access using invalid key from: ", addr)
+		// replySomething()
+		// return
+	}
+
+	if (options & doDNS) > 0 {
+		host := string(rkeybuf)
+		ip, err := net.ResolveIPAddr("ip4", host)
+		if err != nil {
+			logg.W(err)
+			ip = &net.IPAddr{IP: net.IP{127, 0, 0, 1}}
+		}
+
+		logg.D("DNS: ", host, " ", ip.String())
+		w.Header().Add(dnsRespHeader, base32Encode([]byte(ip.IP.To4()), true))
+		w.WriteHeader(200)
+
+	} else if options.IsSet(doConnect) {
+		host := proxy.Cipher.DecryptDecompress(stripURI(r.RequestURI), rkeybuf...)
+		if host == "" {
+			logg.W("we had a valid rkey, but invalid host, from: ", addr)
+			replySomething()
+			return
+		}
+
+		logg.D("CONNECT ", host)
 		downstreamConn := proxy.hijack(w)
 		if downstreamConn == nil {
 			return
 		}
 
 		ioc := proxy.getIOConfig(auth)
+		ioc.Partial = options.IsSet(doPartial)
 
-		// we are outside GFW and should pass data to the real target
-		targetSiteConn, err := net.Dial("tcp", host)
+		var targetSiteConn net.Conn
+		var err error
+
+		if options.IsSet(doUDPRelay) {
+			if proxy.DisableUDP {
+				logg.W("client is trying to send UDP data but we disabled it")
+				downstreamConn.Close()
+				return
+			}
+
+			uaddr, _ := net.ResolveUDPAddr("udp", host)
+
+			var rconn *net.UDPConn
+			rconn, err = net.DialUDP("udp", nil, uaddr)
+			targetSiteConn = &udpBridgeConn{
+				UDPConn: rconn,
+				udpSrc:  uaddr,
+			}
+			// rconn.Write([]byte{6, 7, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 5, 98, 97, 105, 100, 117, 3, 99, 111, 109, 0, 0, 1, 0, 1})
+		} else {
+			targetSiteConn, err = net.Dial("tcp", host)
+		}
+
 		if err != nil {
 			logg.E(err)
+			downstreamConn.Close()
 			return
 		}
 
-		if mark == HOST_HTTP_CONNECT {
-			// response HTTP 200 OK to downstream, and it will not be xored in IOCopyCipher
-			downstreamConn.Write(OK_HTTP)
+		var p string
+		if options.IsSet(doWebSocket) {
+			ioc.WSCtrl = wsServer
+			p = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-WebSocket-Accept: " + (rkey + rkey)[4:32] + "\r\n\r\n"
 		} else {
-			downstreamConn.Write(OK_SOCKS)
+			p = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nDate: " + time.Now().UTC().Format(time.RFC1123) + "\r\n\r\n"
 		}
 
-		proxy.GCipher.Bridge(targetSiteConn, downstreamConn, rkeybuf, ioc)
-	} else if mark == HOST_HTTP_FORWARD {
-		proxy.decryptRequest(r, rkeybuf)
-		logg.D(r.Method, " ", r.Host)
+		downstreamConn.Write([]byte(p))
+		go proxy.Cipher.IO.Bridge(downstreamConn, targetSiteConn, rkeybuf, ioc)
+	} else if options.IsSet(doForward) {
+		if !proxy.decryptRequest(r, rkeybuf) {
+			replySomething()
+			return
+		}
 
+		logg.D(r.Method, " ", r.URL.String())
+
+		r.Header.Del(proxy.rkeyHeader)
 		resp, err := proxy.tp.RoundTrip(r)
 		if err != nil {
-			logg.E("proxy pass: ", r.URL, ", ", err)
-			proxy.Write(w, r, []byte(err.Error()), http.StatusInternalServerError)
+			logg.E("HTTP forward: ", r.URL, ", ", err)
+			proxy.Write(w, rkeybuf, []byte(err.Error()), http.StatusInternalServerError)
 			return
 		}
 
@@ -225,74 +240,60 @@ AUTH_OK:
 			logg.D("[", resp.Status, "] - ", r.URL)
 		}
 
-		copyHeaders(w.Header(), resp.Header)
+		copyHeaders(w.Header(), resp.Header, proxy.Cipher, true, rkeybuf)
 		w.WriteHeader(resp.StatusCode)
 
-		iocc := proxy.GCipher.WrapIO(w, resp.Body, rkeybuf, proxy.getIOConfig(auth))
-		iocc.Partial = false // HTTP must be fully encrypted
-
-		nr, err := iocc.DoCopy()
-		tryClose(resp.Body)
-
-		if err != nil {
-			logg.E("io.wrap ", nr, "bytes: ", err)
+		if nr, err := proxy.Cipher.IO.Copy(w, resp.Body, rkeybuf, proxy.getIOConfig(auth)); err != nil {
+			logg.E("copy ", nr, " bytes: ", err)
 		}
+
+		tryClose(resp.Body)
 	} else {
 		proxy.blacklist.Add(addr, nil)
-		replyRandom()
+		replySomething()
 	}
 }
 
-func StartServer(addr string, config *ServerConfig) {
-	word := genWord(config.GCipher)
+func (proxy *ProxyUpstream) Start() error {
+	ln, err := tcpmux.Listen(proxy.Localaddr, true)
+	if err != nil {
+		return err
+	}
+
+	proxy.Cipher.IO.Ob = ln.(*tcpmux.ListenPool)
+	return http.Serve(ln, proxy)
+}
+
+func NewServer(addr string, config *ServerConfig) *ProxyUpstream {
 	proxy := &ProxyUpstream{
-		tp: &http.Transport{
-			TLSClientConfig: tlsSkip,
-		},
+		tp: &http.Transport{TLSClientConfig: tlsSkip},
 
 		ServerConfig:  config,
 		blacklist:     lru.NewCache(128),
 		trustedTokens: make(map[string]bool),
-		rkeyHeader:    "X-" + word,
+		rkeyHeader:    "X-" + config.Cipher.Alias,
 	}
+
+	tcpmux.Version = checksum1b([]byte(config.Cipher.Alias)) | 0x80
 
 	if config.ProxyPassAddr != "" {
 		if strings.HasPrefix(config.ProxyPassAddr, "http") {
 			u, err := url.Parse(config.ProxyPassAddr)
 			if err != nil {
 				logg.F(err)
+				return nil
 			}
 
-			logg.L("alternatively act as reverse proxy: ", config.ProxyPassAddr)
 			proxy.rp = httputil.NewSingleHostReverseProxy(u)
 		} else {
-			logg.L("alternatively act as file server: ", config.ProxyPassAddr)
 			proxy.rp = http.FileServer(http.Dir(config.ProxyPassAddr))
 		}
-	}
-
-	if proxy.UDPRelayListen != 0 {
-		l, err := net.ListenTCP("tcp", &net.TCPAddr{
-			IP:   net.IPv6zero,
-			Port: proxy.UDPRelayListen,
-		})
-
-		if err != nil {
-			logg.F(err)
-		}
-
-		go func() {
-			for {
-				c, _ := l.Accept()
-				go proxy.handleTCPtoUDP(c)
-			}
-		}()
 	}
 
 	if port, lerr := strconv.Atoi(addr); lerr == nil {
 		addr = (&net.TCPAddr{IP: net.IPv4zero, Port: port}).String()
 	}
 
-	logg.L("Hi! ", word, ", server is listening at ", addr)
-	logg.F(http.ListenAndServe(addr, proxy))
+	proxy.Localaddr = addr
+	return proxy
 }
